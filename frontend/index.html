@@ -8,6 +8,10 @@
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <link href="https://unpkg.com/maplibre-gl@4.0.0/dist/maplibre-gl.css" rel="stylesheet" />
     <link rel="stylesheet" href="/src/styles/main.css" />
+
+    <!-- CDN statt npm-Pakete – kein Build-Schritt nötig -->
+    <script src="https://unpkg.com/maplibre-gl@4.0.0/dist/maplibre-gl.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   </head>
   <body>
     <div id="app">
@@ -39,7 +43,9 @@
           </div>
         </div>
       </header>
+
       <div id="map"></div>
+
       <div id="side-panel" class="hidden">
         <div id="panel-inner">
           <button id="panel-close">
@@ -50,10 +56,13 @@
           <div id="panel-content"></div>
         </div>
       </div>
+
       <div id="stats-bar">
         <span id="stats-update">Warte auf Daten…</span>
       </div>
     </div>
-    <script type="module" src="/src/main.js"></script>
+
+    <!-- Kein type="module" – läuft direkt im Browser -->
+    <script src="/src/app.js"></script>
   </body>
 </html>
