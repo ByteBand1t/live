@@ -107,15 +107,19 @@ async function poll() {
 function normalizeJourney(journey) {
   const now      = Date.now();
   const segments = journey.segments || [];
-  const activeSeg = segments.find(s => s.startDateTime <= now && s.endDateTime >= now)
-                 || segments[0];
+
+  // Geofox gibt startDateTime/endDateTime in Sekunden zurück → in ms umrechnen
+  const activeSeg = segments.find(s =>
+    s.startDateTime * 1000 <= now && s.endDateTime * 1000 >= now
+  ) || segments[0];
 
   if (!activeSeg) return { id: journey.journeyID, lat: null, lon: null };
 
-  const track = activeSeg.track?.track || [];
+  const track      = activeSeg.track?.track || [];
+  const segStartMs = activeSeg.startDateTime * 1000;
+  const segEndMs   = activeSeg.endDateTime   * 1000;
 
-  // Aktuelle Position für initiales Rendering
-  const pos = interpolatePosition(track, activeSeg.startDateTime, activeSeg.endDateTime, now);
+  const pos = interpolatePosition(track, segStartMs, segEndMs, now);
 
   return {
     id:              journey.journeyID,
@@ -124,15 +128,14 @@ function normalizeJourney(journey) {
     direction:       activeSeg.destination || journey.line?.direction || "",
     lat:             pos.lat,
     lon:             pos.lon,
-    // Track-Daten für client-seitige Animation
     trackData:       track,
-    segStartMs:      activeSeg.startDateTime,
-    segEndMs:        activeSeg.endDateTime,
+    segStartMs,       // jetzt korrekt in Millisekunden
+    segEndMs,         // jetzt korrekt in Millisekunden
     delay:           activeSeg.realtimeDelay  || 0,
     realtime:        journey.realtime         || false,
     vehicleType:     journey.vehicleType      || "METROBUS",
     startStationKey: activeSeg.startStationKey || null,
-    startDateTime:   activeSeg.startDateTime   || null,
+    startDateTime:   activeSeg.startDateTime   || null, // Sekunden – für departureCourse
     color:           null,
   };
 }
