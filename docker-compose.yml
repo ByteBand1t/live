@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    container_name: hbl-backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3001:3001"
+    depends_on:
+      - redis
+    networks:
+      - hbl-network
+
+  frontend:
+    build: ./frontend
+    container_name: hbl-frontend
+    restart: unless-stopped
+    networks:
+      - hbl-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: hbl-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - hbl-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: hbl-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - hbl-network
+
+networks:
+  hbl-network:
+    driver: bridge
+
+volumes:
+  redis-data:

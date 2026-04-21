@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hamburg Bus Live</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://unpkg.com/maplibre-gl@4.0.0/dist/maplibre-gl.css"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles/main.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Header -->
+      <header id="header">
+        <div class="header-left">
+          <span class="logo-icon">🚌</span>
+          <span class="logo-text">Hamburg<strong>Bus</strong></span>
+          <div id="live-badge">
+            <span class="dot"></span>
+            <span id="bus-count">–</span> Busse
+          </div>
+        </div>
+        <div class="header-right">
+          <div id="search-container">
+            <input
+              id="search-input"
+              type="text"
+              placeholder="Haltestelle, Linie suchen…"
+              autocomplete="off"
+            />
+            <div id="search-results"></div>
+          </div>
+          <div id="status-indicator" class="status-connecting">
+            <span class="status-dot"></span>
+            <span id="status-text">Verbinde…</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Map -->
+      <div id="map"></div>
+
+      <!-- Side Panel -->
+      <div id="side-panel" class="hidden">
+        <button id="panel-close">✕</button>
+        <div id="panel-content"></div>
+      </div>
+
+      <!-- Bottom Stats Bar -->
+      <div id="stats-bar">
+        <span id="stats-delay"></span>
+        <span id="stats-update">Noch kein Update</span>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
