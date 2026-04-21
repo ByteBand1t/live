@@ -5,7 +5,13 @@ services:
     build: ./backend
     container_name: hbl-backend
     restart: unless-stopped
-    env_file: .env
+    environment:
+      - GEOFOX_USER=${GEOFOX_USER}
+      - GEOFOX_PASSWORD=${GEOFOX_PASSWORD}
+      - POLL_INTERVAL_MS=${POLL_INTERVAL_MS:-5000}
+      - REDIS_URL=redis://redis:6379
+      - NODE_ENV=production
+      - PORT=3001
     ports:
       - "3001:3001"
     depends_on:
@@ -34,7 +40,7 @@ services:
     container_name: hbl-nginx
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "4699:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
