@@ -1,7 +1,6 @@
 const crypto = require("crypto");
 const GTI_BASE_URL = "https://gti.geofox.de/gti/public";
 
-// Alle Bus-Typen laut OpenAPI-Schema
 const ALL_BUS_TYPES = [
   "METROBUS", "REGIONALBUS", "SCHNELLBUS",
   "NACHTBUS", "XPRESSBUS", "AST", "EILBUS"
@@ -74,8 +73,8 @@ async function departureCourse(lineKey, stationId, time) {
   });
 }
 
-// ← FIXES: vehicleTypes mit korrekten Enum-Werten, realtime statt useRealtime
 async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
+  const now = Date.now();
   return geofoxRequest("getVehicleMap", {
     coordinateType: "EPSG_4326",
     boundingBox: {
@@ -83,7 +82,9 @@ async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
       upperRight: { x: boundingBox.lonMax, y: boundingBox.latMax },
     },
     vehicleTypes,
-    realtime: true,  // ← war useRealtime: true – FALSCH
+    realtime: true,
+    periodBegin: now,
+    periodEnd: now + 3600000, // 1 Stunde voraus
   });
 }
 
@@ -116,4 +117,7 @@ function formatTime(date) {
   return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
 }
 
-module.exports = { init, checkName, departureList, departureCourse, getVehicleMap, getTrackCoordinates, listStations, listLines, getAnnouncements };
+module.exports = {
+  init, checkName, departureList, departureCourse,
+  getVehicleMap, getTrackCoordinates, listStations, listLines, getAnnouncements
+};
