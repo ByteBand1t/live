@@ -1,14 +1,15 @@
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 var map            = null;
 var socket         = null;
 var allStations    = [];
-var allVehicles    = [];
+var allVehicles    = {};   // id → vehicle (inkl. trackData)
 var stationsLoaded = false;
-var busMarkers     = {};
+var busMarkers     = {};   // id → { marker, el }
 var stationMarkers = {};
 var selectedBusId  = null;
 var searchTimeout  = null;
 var viewportDebounce = null;
+var animationRunning = false;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", function() {
@@ -24,21 +25,17 @@ function initMap() {
     container: "map",
     style: {
       version: 8,
-      sources: {
-        osm: {
-          type: "raster",
-          tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          tileSize: 256,
-          attribution: "© OpenStreetMap contributors",
-          maxzoom: 19,
-        },
-      },
+      sources: { osm: {
+        type: "raster",
+        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tileSize: 256,
+        attribution: "© OpenStreetMap contributors",
+        maxzoom: 19,
+      }},
       layers: [{ id: "osm", type: "raster", source: "osm" }],
     },
     center: [10.0060, 53.5530],
-    zoom: 14,
-    minZoom: 9,
-    maxZoom: 18,
+    zoom: 14, minZoom: 9, maxZoom: 18,
   });
 
   map.addControl(new maplibregl.NavigationControl(), "bottom-right");
@@ -49,10 +46,11 @@ function initMap() {
 
   map.on("load", function() {
     sendViewport();
+    startAnimationLoop();
     fetch("/api/stations")
       .then(function(r) { return r.json(); })
       .then(function(d) {
-        allStations    = d.stations || [];
+        allStations = d.stations || [];
         stationsLoaded = true;
         renderStationsInViewport();
       })
@@ -60,7 +58,7 @@ function initMap() {
   });
 
   map.on("moveend", sendViewport);
-  map.on("zoomend",  function() { sendViewport(); renderBusMarkersFromCache(); });
+  map.on("zoomend", function() { sendViewport(); });
 }
 
 function sendViewport() {
@@ -77,55 +75,103 @@ function sendViewport() {
   }, 400);
 }
 
-// ─── Bus Markers ──────────────────────────────────────────────────────────────
-function renderBusMarkersFromCache() {
-  updateBusMarkers(allVehicles);
+// ─── Animation Loop ───────────────────────────────────────────────────────────
+// Läuft mit requestAnimationFrame – interpoliert Bus-Positionen kontinuierlich
+// anhand der Track-Daten und Timestamps aus der API.
+// So bewegen sich Busse flüssig statt alle 5s zu springen.
+
+function startAnimationLoop() {
+  if (animationRunning) return;
+  animationRunning = true;
+  requestAnimationFrame(animationTick);
 }
 
-function updateBusMarkers(vehicles) {
-  var currentIds = {};
-  for (var i = 0; i < vehicles.length; i++) {
-    if (vehicles[i].id) currentIds[vehicles[i].id] = true;
-  }
+function animationTick() {
+  if (!map) { requestAnimationFrame(animationTick); return; }
 
-  for (var id in busMarkers) {
-    if (!currentIds[id]) {
-      busMarkers[id].marker.remove();
-      delete busMarkers[id];
+  var now    = Date.now();
+  var bounds = map.getBounds();
+
+  for (var id in allVehicles) {
+    var v = allVehicles[id];
+    if (!v.trackData || v.trackData.length < 2) continue;
+    if (!busMarkers[id]) continue;
+
+    var pos = interpolatePosition(v.trackData, v.segStartMs, v.segEndMs, now);
+    if (!pos.lat || !pos.lon) continue;
+
+    // Nur updaten wenn im Viewport
+    if (bounds.contains([pos.lon, pos.lat])) {
+      busMarkers[id].marker.setLngLat([pos.lon, pos.lat]);
     }
   }
 
-  var bounds = map.getBounds();
+  requestAnimationFrame(animationTick);
+}
+
+function interpolatePosition(track, startMs, endMs, now) {
+  if (!track || track.length < 2) return { lat: null, lon: null };
+  var duration = endMs - startMs;
+  if (duration <= 0) return { lon: track[track.length-2], lat: track[track.length-1] };
+
+  var progress   = Math.max(0, Math.min(1, (now - startMs) / duration));
+  var pointCount = Math.floor(track.length / 2);
+  if (pointCount === 1) return { lon: track[0], lat: track[1] };
+
+  var floatIdx = progress * (pointCount - 1);
+  var idx      = Math.floor(floatIdx);
+  var frac     = floatIdx - idx;
+  var next     = Math.min(idx + 1, pointCount - 1);
+
+  return {
+    lon: track[idx*2]   + frac * (track[next*2]   - track[idx*2]),
+    lat: track[idx*2+1] + frac * (track[next*2+1] - track[idx*2+1]),
+  };
+}
+
+// ─── Bus Markers ──────────────────────────────────────────────────────────────
+function syncBusMarkers(vehicles) {
+  var bounds    = map.getBounds();
+  var newIds    = {};
 
   for (var i = 0; i < vehicles.length; i++) {
     var v = vehicles[i];
     if (!v.id || !v.lat || !v.lon) continue;
-    if (!bounds.contains([v.lon, v.lat])) {
-      if (busMarkers[v.id]) {
-        busMarkers[v.id].marker.remove();
-        delete busMarkers[v.id];
-      }
-      continue;
-    }
+    newIds[v.id] = true;
 
-    if (busMarkers[v.id]) {
-      busMarkers[v.id].marker.setLngLat([v.lon, v.lat]);
-      var el = busMarkers[v.id].el;
-      el.textContent = v.line || "?";
-      el.style.background = lineColor(v.line);
-      el.classList.toggle("delayed",  v.delay > 120);
-      el.classList.toggle("selected", v.id === selectedBusId);
-    } else {
-      var el = createBusEl(v);
-      (function(vehicle, element) {
-        element.addEventListener("click", function() { handleBusClick(vehicle); });
-      })(v, el);
-      var marker = new maplibregl.Marker({ element: el, anchor: "center" })
-        .setLngLat([v.lon, v.lat])
-        .addTo(map);
-      busMarkers[v.id] = { marker: marker, el: el };
+    // Vehicle-Daten für Animation-Loop speichern
+    allVehicles[v.id] = v;
+
+    if (bounds.contains([v.lon, v.lat])) {
+      if (!busMarkers[v.id]) {
+        // Neuen Marker erstellen
+        var el     = createBusEl(v);
+        var marker = new maplibregl.Marker({ element: el, anchor: "center" })
+          .setLngLat([v.lon, v.lat])
+          .addTo(map);
+        busMarkers[v.id] = { marker: marker, el: el };
+        attachBusClick(v.id, el);
+      } else {
+        // Label + Farbe aktualisieren, Position kommt vom AnimationLoop
+        updateBusEl(busMarkers[v.id].el, v);
+      }
     }
   }
+
+  // Marker entfernen die nicht mehr existieren
+  for (var id in busMarkers) {
+    if (!newIds[id]) {
+      busMarkers[id].marker.remove();
+      delete busMarkers[id];
+      delete allVehicles[id];
+    }
+  }
+}
+
+function attachBusClick(id, el) {
+  el.addEventListener("click", function() {
+    if (allVehicles[id]) handleBusClick(allVehicles[id]);
+  });
 }
 
 function createBusEl(v) {
@@ -133,10 +179,18 @@ function createBusEl(v) {
   el.className = "bus-marker";
   el.style.background = lineColor(v.line);
   el.textContent = v.line || "?";
-  el.title = "Linie " + v.line + " → " + v.direction;
-  if (v.delay > 120)    el.classList.add("delayed");
+  el.title       = "Linie " + (v.line||"?") + " → " + (v.direction||"");
+  if (v.delay > 120)       el.classList.add("delayed");
   if (v.id === selectedBusId) el.classList.add("selected");
   return el;
+}
+
+function updateBusEl(el, v) {
+  el.textContent      = v.line || "?";
+  el.style.background = lineColor(v.line);
+  el.title            = "Linie " + (v.line||"?") + " → " + (v.direction||"");
+  el.classList.toggle("delayed",  v.delay > 120);
+  el.classList.toggle("selected", v.id === selectedBusId);
 }
 
 function lineColor(name) {
@@ -149,45 +203,42 @@ function lineColor(name) {
 
 // ─── Station Markers ──────────────────────────────────────────────────────────
 function renderStationsInViewport() {
-  for (var id in stationMarkers) {
-    stationMarkers[id].remove();
-  }
+  for (var id in stationMarkers) stationMarkers[id].remove();
   stationMarkers = {};
 
   if (map.getZoom() < 14) return;
 
   var bounds  = map.getBounds();
-  var visible = [];
+  var count   = 0;
+
   for (var i = 0; i < allStations.length; i++) {
     var s = allStations[i];
-    if (s.coordinate && bounds.contains([s.coordinate.x, s.coordinate.y])) {
-      visible.push(s);
-      if (visible.length >= 200) break;
-    }
-  }
+    if (!s.coordinate) continue;
+    if (!bounds.contains([s.coordinate.x, s.coordinate.y])) continue;
+    if (count++ >= 200) break;
 
-  for (var i = 0; i < visible.length; i++) {
-    var station = visible[i];
     var el = document.createElement("div");
     el.className = "station-marker";
-    el.title = station.name;
-    (function(st, element) {
+    el.title     = s.name;
+    (function(station, element) {
       element.addEventListener("click", function() {
-        document.querySelectorAll(".station-marker.active").forEach(function(m) { m.classList.remove("active"); });
+        document.querySelectorAll(".station-marker.active")
+          .forEach(function(m) { m.classList.remove("active"); });
         element.classList.add("active");
-        handleStationClick(st);
+        handleStationClick(station);
       });
-    })(station, el);
-    var m = new maplibregl.Marker({ element: el, anchor: "center" })
-      .setLngLat([station.coordinate.x, station.coordinate.y])
+    })(s, el);
+
+    stationMarkers[s.id] = new maplibregl.Marker({ element: el, anchor: "center" })
+      .setLngLat([s.coordinate.x, s.coordinate.y])
       .addTo(map);
-    stationMarkers[station.id] = m;
   }
 }
 
 // ─── Route Line ───────────────────────────────────────────────────────────────
 function showRouteLine(coords, color) {
   clearRouteLine();
+  if (!coords || !coords.length) return;
   var geojson = {
     type: "Feature",
     geometry: { type: "LineString", coordinates: coords.map(function(c) { return [c.x, c.y]; }) },
@@ -198,8 +249,8 @@ function showRouteLine(coords, color) {
 }
 
 function clearRouteLine() {
-  if (map.getLayer("route-line")) map.removeLayer("route-line");
-  if (map.getSource("route"))    map.removeSource("route");
+  try { if (map.getLayer("route-line")) map.removeLayer("route-line"); } catch(e) {}
+  try { if (map.getSource("route"))    map.removeSource("route");     } catch(e) {}
 }
 
 function flyTo(lon, lat, zoom) {
@@ -210,16 +261,13 @@ function flyTo(lon, lat, zoom) {
 function initSocket() {
   socket = io({ transports: ["websocket", "polling"] });
 
-  socket.on("connect", function() {
-    setStatus("connected", "Live");
-    sendViewport();
-  });
-  socket.on("disconnect", function() { setStatus("error", "Getrennt"); });
-  socket.on("connect_error", function() { setStatus("error", "Fehler"); });
+  socket.on("connect",       function() { setStatus("connected",  "Live");     sendViewport(); });
+  socket.on("disconnect",    function() { setStatus("error",      "Getrennt"); });
+  socket.on("connect_error", function() { setStatus("error",      "Fehler");   });
 
   socket.on("vehicles:update", function(data) {
-    allVehicles = data.vehicles || [];
-    updateBusMarkers(allVehicles);
+    var vehicles = data.vehicles || [];
+    syncBusMarkers(vehicles);
     document.getElementById("bus-count").textContent  = data.count || 0;
     document.getElementById("stats-update").textContent =
       "Zuletzt: " + new Date(data.timestamp).toLocaleTimeString("de-DE");
@@ -239,8 +287,10 @@ function openPanel(html) {
 
 function closePanel() {
   document.getElementById("side-panel").classList.add("hidden");
-  document.querySelectorAll(".station-marker.active").forEach(function(m) { m.classList.remove("active"); });
-  document.querySelectorAll(".bus-marker.selected").forEach(function(m) { m.classList.remove("selected"); });
+  document.querySelectorAll(".station-marker.active")
+    .forEach(function(m) { m.classList.remove("active"); });
+  document.querySelectorAll(".bus-marker.selected")
+    .forEach(function(m) { m.classList.remove("selected"); });
   selectedBusId = null;
   clearRouteLine();
 }
@@ -249,14 +299,14 @@ function showLoadingPanel(title) {
   openPanel(
     '<div class="panel-chip">Lädt</div>' +
     '<div class="panel-title">' + title + '</div>' +
-    '<div class="panel-loading"><div class="spinner"></div>Echtzeit-Daten werden abgerufen…</div>'
+    '<div class="panel-loading"><div class="spinner"></div>Echtzeit-Daten…</div>'
   );
 }
 
 // ─── Bus Click ────────────────────────────────────────────────────────────────
 function handleBusClick(bus) {
   selectedBusId = bus.id;
-  updateBusMarkers(allVehicles);
+  if (busMarkers[bus.id]) updateBusEl(busMarkers[bus.id].el, bus);
   flyTo(bus.lon, bus.lat, 15);
   showLoadingPanel("Linie " + (bus.line || "?"));
 
@@ -269,30 +319,13 @@ function handleBusClick(bus) {
       startDateTime: bus.startDateTime,
     }),
   })
-  .then(function(r) { return r.json(); })
+  .then(function(r) {
+    if (!r.ok) throw new Error("Status " + r.status);
+    return r.json();
+  })
   .then(function(course) {
     renderBusPanel(bus, course);
-    var stopKeys = (course.stopList || [])
-      .map(function(s) { return s.stopPointKey || s.stationKey; })
-      .filter(Boolean);
-    if (stopKeys.length >= 2) {
-      fetch("/api/track", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stopPointKeys: stopKeys }),
-      })
-      .then(function(r) { return r.json(); })
-      .then(function(td) {
-        if (td.tracks && td.tracks.length) {
-          var coords = [];
-          for (var i = 0; i < td.tracks.length; i++) {
-            var pts = td.tracks[i].track || [];
-            for (var j = 0; j + 1 < pts.length; j += 2) coords.push({ x: pts[j], y: pts[j+1] });
-          }
-          if (coords.length) showRouteLine(coords, bus.color || "#E2001A");
-        }
-      });
-    }
+    loadRouteForCourse(course, bus.color || "#E2001A");
   })
   .catch(function(err) {
     console.error("[BusCourse]", err);
@@ -300,40 +333,66 @@ function handleBusClick(bus) {
   });
 }
 
+function loadRouteForCourse(course, color) {
+  var stopKeys = (course.stopList || [])
+    .map(function(s) { return s.stopPointKey || s.stationKey; })
+    .filter(Boolean);
+  if (stopKeys.length < 2) return;
+
+  fetch("/api/track", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stopPointKeys: stopKeys }),
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(td) {
+    if (!td.tracks || !td.tracks.length) return;
+    var coords = [];
+    for (var i = 0; i < td.tracks.length; i++) {
+      var pts = td.tracks[i].track || [];
+      for (var j = 0; j + 1 < pts.length; j += 2) {
+        coords.push({ x: pts[j], y: pts[j+1] });
+      }
+    }
+    if (coords.length) showRouteLine(coords, color);
+  })
+  .catch(function(err) { console.error("[Track]", err); });
+}
+
 function renderBusPanel(bus, course) {
   var bg      = bus.color || lineColor(bus.line);
   var delay   = bus.delay || 0;
   var delayed = delay > 60;
-  var statusText = delayed
-    ? ("+" + Math.round(delay / 60) + " Min Verspätung")
+  var statusTxt = delayed
+    ? ("+" + Math.round(delay/60) + " Min Verspätung")
     : "Pünktlich ✓";
 
   var stopsHtml = "";
-  if (course && course.stopList && course.stopList.length) {
-    for (var i = 0; i < course.stopList.length; i++) {
-      var stop = course.stopList[i];
-      var time = (stop.time && stop.time.time) ? stop.time.time : "";
-      var name = stop.station ? stop.station.name : (stop.stationName || "–");
-      var cls  = stop.isCurrentStop ? "current" : (stop.isPassed ? "passed" : "upcoming");
-      stopsHtml +=
-        '<div class="stop-item ' + cls + '">' +
+  var stopList  = course && course.stopList ? course.stopList : [];
+
+  for (var i = 0; i < stopList.length; i++) {
+    var stop = stopList[i];
+    var time = stop.time && stop.time.time ? stop.time.time : "";
+    var name = stop.station ? stop.station.name : (stop.stationName || "–");
+    var cls  = stop.isCurrentStop ? "current" : (stop.isPassed ? "passed" : "upcoming");
+    stopsHtml +=
+      '<div class="stop-item ' + cls + '">' +
         '<div class="stop-time">' + time + '</div>' +
         '<div class="stop-name ' + cls + '">' + name + '</div>' +
-        '</div>';
-    }
+      '</div>';
   }
 
   openPanel(
     '<div class="panel-chip">🚌 Bus</div>' +
     '<div class="bus-header">' +
-      '<div class="bus-line-badge" style="background:' + bg + '">' + (bus.line || "?") + '</div>' +
+      '<div class="bus-line-badge" style="background:' + bg + '">' + (bus.line||"?") + '</div>' +
       '<div class="bus-meta">' +
-        '<div class="bus-direction">→ ' + (bus.direction || "–") + '</div>' +
-        '<div class="bus-type">' + (bus.vehicleType || "Bus") + ' · Echtzeit</div>' +
+        '<div class="bus-direction">→ ' + (bus.direction||"–") + '</div>' +
+        '<div class="bus-type">' + (bus.vehicleType||"Bus") + '</div>' +
       '</div>' +
     '</div>' +
     '<div class="bus-status-pill ' + (delayed ? "delayed" : "ontime") + '">' +
-      (delayed ? "⚠️ " : "✓ ") + statusText +
+      (delayed ? "⚠️ " : "✓ ") + statusTxt +
     '</div>' +
     (stopsHtml
       ? '<div class="panel-section-label">Streckenverlauf</div><div class="stop-timeline">' + stopsHtml + '</div>'
@@ -348,23 +407,42 @@ function handleStationClick(station) {
   showLoadingPanel(station.name);
   flyTo(station.coordinate.x, station.coordinate.y, 15);
 
-  fetch("/api/departures/" + encodeURIComponent(station.id))
-    .then(function(r) { return r.json(); })
-    .then(function(data) { renderStationPanel(station, data.departures || []); })
-    .catch(function(err) { console.error("[Departures]", err); });
+  var url = "/api/departures/" + encodeURIComponent(station.id);
+  console.log("[Departures] Fetching:", url);
+
+  fetch(url)
+    .then(function(r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function(data) {
+      console.log("[Departures] Response:", data);
+      renderStationPanel(station, data.departures || []);
+    })
+    .catch(function(err) {
+      console.error("[Departures] Error:", err);
+      openPanel(
+        '<div class="panel-chip">🚏 Haltestelle</div>' +
+        '<div class="panel-title">' + station.name + '</div>' +
+        '<div class="panel-loading">Fehler beim Laden: ' + err.message + '</div>'
+      );
+    });
 }
 
 function renderStationPanel(station, departures) {
+  console.log("[Departures] Rendering", departures.length, "items:", departures[0]);
+
   var itemsHtml = "";
   for (var i = 0; i < departures.length; i++) {
-    var dep     = departures[i];
-    var delay   = dep.delay || dep.depDelay || 0;
-    var delayed = delay > 60;
-    var bg      = (dep.line && dep.line.color) ? dep.line.color : lineColor(dep.line && dep.line.name);
-    var lineName = (dep.line && dep.line.name) ? dep.line.name : "?";
-    var time    = dep.timeOffset || (dep.time && dep.time.time) || "–";
-    var dir     = dep.direction || "–";
-    var lineKey = (dep.serviceId && dep.serviceId.id) || (dep.line && dep.line.id) || "";
+    var dep      = departures[i];
+    var delay    = dep.delay || dep.depDelay || 0;
+    var delayed  = delay > 60;
+    var lineName = dep.line && dep.line.name ? dep.line.name : "?";
+    var bg       = dep.line && dep.line.color ? dep.line.color : lineColor(lineName);
+    var time     = dep.timeOffset || (dep.time && dep.time.time) || "–";
+    var dir      = dep.direction || "–";
+    var lineKey  = (dep.serviceId && dep.serviceId.id)
+                || (dep.line && dep.line.id) || "";
 
     itemsHtml +=
       '<div class="departure-item" data-linekey="' + lineKey + '" data-station="' + station.id + '">' +
@@ -389,11 +467,11 @@ function renderStationPanel(station, departures) {
     '</div>'
   );
 
-  document.querySelectorAll(".departure-item").forEach(function(el) {
+  document.querySelectorAll(".departure-item[data-linekey]").forEach(function(el) {
     el.addEventListener("click", function() {
-      var lineKey   = el.dataset.linekey;
-      var stationId = el.dataset.station;
-      if (lineKey) handleCourseClick(lineKey, stationId);
+      var lk = el.dataset.linekey;
+      var sid = el.dataset.station;
+      if (lk) handleCourseClick(lk, sid);
     });
   });
 }
@@ -406,25 +484,7 @@ function handleCourseClick(lineKey, stationId) {
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
-    var keys = (data.stopList || []).map(function(s) { return s.stationKey; }).filter(Boolean);
-    if (keys.length) {
-      fetch("/api/track", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stopPointKeys: keys }),
-      })
-      .then(function(r) { return r.json(); })
-      .then(function(td) {
-        if (td.tracks && td.tracks.length) {
-          var coords = [];
-          for (var i = 0; i < td.tracks.length; i++) {
-            var pts = td.tracks[i].track || [];
-            for (var j = 0; j + 1 < pts.length; j += 2) coords.push({ x: pts[j], y: pts[j+1] });
-          }
-          if (coords.length) showRouteLine(coords);
-        }
-      });
-    }
+    loadRouteForCourse(data, "#E2001A");
     renderBusPanel({ line: lineKey, direction: data.direction || "" }, data);
   })
   .catch(function(err) { console.error("[Course]", err); });
@@ -443,11 +503,16 @@ function initSearch() {
   });
 
   searchInput.addEventListener("keydown", function(e) {
-    if (e.key === "Escape") { searchResults.classList.remove("visible"); searchInput.blur(); }
+    if (e.key === "Escape") {
+      searchResults.classList.remove("visible");
+      searchInput.blur();
+    }
   });
 
   document.addEventListener("click", function(e) {
-    if (!e.target.closest("#search-container")) searchResults.classList.remove("visible");
+    if (!e.target.closest("#search-container")) {
+      searchResults.classList.remove("visible");
+    }
   });
 
   function doSearch(q) {
@@ -464,11 +529,12 @@ function initSearch() {
             var lon = r.coordinate ? r.coordinate.x : "";
             var lat = r.coordinate ? r.coordinate.y : "";
             html +=
-              '<div class="search-item" data-id="' + (r.id||"") +
-              '" data-type="' + (r.type||"") +
-              '" data-lon="'  + lon +
-              '" data-lat="'  + lat +
-              '" data-name="' + (r.name||"").replace(/"/g, "&quot;") + '">' +
+              '<div class="search-item"' +
+              ' data-id="'   + (r.id   || "") + '"' +
+              ' data-type="' + (r.type || "") + '"' +
+              ' data-lon="'  + lon + '"' +
+              ' data-lat="'  + lat + '"' +
+              ' data-name="' + (r.name || "").replace(/"/g, "&quot;") + '">' +
               '<div class="item-name">' + (r.name||"") + '</div>' +
               '<div class="item-type">' + (r.type||"") + (r.city ? " · " + r.city : "") + '</div>' +
               '</div>';
