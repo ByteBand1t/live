@@ -74,8 +74,8 @@ async function poll() {
           if (!journey.journeyID || journey.journeyID === "null") continue;
           const v = normalizeJourney(journey);
           // Nur Fahrzeuge mit gültiger Position UND Track
-          if (v.lat && v.lon && v.trackData && v.trackData.length >= 2) {
-            allVehicles.set(journey.journeyID, v);
+          if (v.lat != null && v.lon != null && v.trackData && v.trackData.length >= 2) {
+            allVehicles.set(v.id, v);
           }
         }
 
@@ -104,6 +104,36 @@ async function poll() {
   }
 }
 
+
+function makeStableVehicleId(journey, activeSeg) {
+  const lineId = journey.line?.id || journey.line?.name || "line";
+  const startStation = activeSeg?.startStationKey || "station";
+  const startTime = activeSeg?.startDateTime || "time";
+  const destination = activeSeg?.destination || journey.line?.direction || "dest";
+  return `${lineId}|${startStation}|${startTime}|${destination}`;
+}
+
+function extractRealtimePosition(journey, activeSeg) {
+  const candidates = [
+    activeSeg?.coordinate,
+    activeSeg?.position,
+    activeSeg?.realtimePosition,
+    activeSeg?.realtime?.coordinate,
+    journey?.coordinate,
+    journey?.position,
+    journey?.realtimePosition,
+  ];
+
+  for (const c of candidates) {
+    if (!c) continue;
+    const lon = c.lon ?? c.lng ?? c.x;
+    const lat = c.lat ?? c.latitude ?? c.y;
+    if (lat != null && lon != null) return { lat, lon };
+  }
+
+  return null;
+}
+
 function normalizeJourney(journey) {
   const now      = Date.now();
   const segments = journey.segments || [];
@@ -119,10 +149,11 @@ function normalizeJourney(journey) {
   const segStartMs = activeSeg.startDateTime * 1000;
   const segEndMs   = activeSeg.endDateTime   * 1000;
 
-  const pos = interpolatePosition(track, segStartMs, segEndMs, now);
+  const realtimePos = extractRealtimePosition(journey, activeSeg);
+  const pos = realtimePos || interpolatePosition(track, segStartMs, segEndMs, now);
 
   return {
-    id:              journey.journeyID,
+    id:              (journey.journeyID && journey.journeyID !== "null") ? journey.journeyID : makeStableVehicleId(journey, activeSeg),
     line:            journey.line?.name  || "?",
     lineId:          journey.line?.id    || null,
     direction:       activeSeg.destination || journey.line?.direction || "",

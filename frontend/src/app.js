@@ -10,7 +10,9 @@ var selectedBusId    = null;
 var searchTimeout    = null;
 var viewportDebounce = null;
 
-var POLL_MS = 5000; // muss mit POLL_INTERVAL_MS im backend übereinstimmen
+var POLL_MS = 5000; // Fallback, wird aus Live-Updates dynamisch angepasst
+var STALE_VEHICLE_MS = 15000;
+var lastServerTs = null;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", function() {
@@ -100,14 +102,25 @@ function animationTick() {
 }
 
 // ─── Bus Markers ──────────────────────────────────────────────────────────────
-function syncBusMarkers(vehicles) {
+function syncBusMarkers(vehicles, serverTimestamp) {
   var bounds = map.getBounds();
   var newIds = {};
   var now    = Date.now();
 
+  if (serverTimestamp) {
+    var ts = new Date(serverTimestamp).getTime();
+    if (!isNaN(ts)) {
+      if (lastServerTs) {
+        var dt = ts - lastServerTs;
+        if (dt >= 1500 && dt <= 20000) POLL_MS = dt;
+      }
+      lastServerTs = ts;
+    }
+  }
+
   for (var i = 0; i < vehicles.length; i++) {
     var v = vehicles[i];
-    if (!v.id || !v.lat || !v.lon) continue;
+    if (!v.id || v.lat == null || v.lon == null) continue;
     newIds[v.id] = true;
 
     var existing = allVehicles[v.id];
@@ -144,12 +157,16 @@ function syncBusMarkers(vehicles) {
     }
   }
 
-  // Entfernte Busse aufräumen
+  // Entfernte Busse erst nach kurzer Karenzzeit aufräumen
   for (var id in busMarkers) {
     if (!newIds[id]) {
-      busMarkers[id].marker.remove();
-      delete busMarkers[id];
-      delete allVehicles[id];
+      var cached = allVehicles[id];
+      var lastSeen = cached && cached._updateTime ? cached._updateTime : 0;
+      if (now - lastSeen > STALE_VEHICLE_MS) {
+        busMarkers[id].marker.remove();
+        delete busMarkers[id];
+        delete allVehicles[id];
+      }
     }
   }
 }
@@ -250,7 +267,7 @@ function initSocket() {
   socket.on("connect_error", function() { setStatus("error",     "Fehler");   });
 
   socket.on("vehicles:update", function(data) {
-    syncBusMarkers(data.vehicles || []);
+    syncBusMarkers(data.vehicles || [], data.timestamp);
     document.getElementById("bus-count").textContent     = data.count || 0;
     document.getElementById("stats-update").textContent  =
       "Zuletzt: " + new Date(data.timestamp).toLocaleTimeString("de-DE");
