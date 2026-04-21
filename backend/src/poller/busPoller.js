@@ -1,7 +1,9 @@
 /**
  * Bus Position Poller
- * Polls Geofox getVehicleMap every POLL_INTERVAL_MS milliseconds
- * and emits updates to all connected WebSocket clients.
+ * Inspiriert von: github.com/bitnulleins/hvv_live_karte
+ *
+ * Position wird anhand von startDateTime/endDateTime
+ * des Segments auf dem Track interpoliert.
  */
 
 const geofox = require("../geofox/client");
@@ -9,22 +11,22 @@ const cache = require("../cache/redis");
 
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
 
+// Bounding Box aus Referenzprojekt übernommen – deckt Hamburg vollständig ab
 const HH_BBOX = {
-  latMin: parseFloat(process.env.HH_BBOX_LAT_MIN || "53.40"),
-  latMax: parseFloat(process.env.HH_BBOX_LAT_MAX || "53.75"),
-  lonMin: parseFloat(process.env.HH_BBOX_LON_MIN || "9.70"),
-  lonMax: parseFloat(process.env.HH_BBOX_LON_MAX || "10.30"),
+  latMin: parseFloat(process.env.HH_BBOX_LAT_MIN || "53.3983"),
+  latMax: parseFloat(process.env.HH_BBOX_LAT_MAX || "53.7393"),
+  lonMin: parseFloat(process.env.HH_BBOX_LON_MIN || "9.7487"),
+  lonMax: parseFloat(process.env.HH_BBOX_LON_MAX || "10.3121"),
 };
 
 function getQuadrants() {
   const midLat = (HH_BBOX.latMin + HH_BBOX.latMax) / 2;
   const midLon = (HH_BBOX.lonMin + HH_BBOX.lonMax) / 2;
-
   return [
-    { latMin: midLat, latMax: HH_BBOX.latMax, lonMin: HH_BBOX.lonMin, lonMax: midLon },
-    { latMin: midLat, latMax: HH_BBOX.latMax, lonMin: midLon, lonMax: HH_BBOX.lonMax },
-    { latMin: HH_BBOX.latMin, latMax: midLat, lonMin: HH_BBOX.lonMin, lonMax: midLon },
-    { latMin: HH_BBOX.latMin, latMax: midLat, lonMin: midLon, lonMax: HH_BBOX.lonMax },
+    { latMin: midLat,        latMax: HH_BBOX.latMax, lonMin: HH_BBOX.lonMin, lonMax: midLon        },
+    { latMin: midLat,        latMax: HH_BBOX.latMax, lonMin: midLon,        lonMax: HH_BBOX.lonMax },
+    { latMin: HH_BBOX.latMin, latMax: midLat,        lonMin: HH_BBOX.lonMin, lonMax: midLon        },
+    { latMin: HH_BBOX.latMin, latMax: midLat,        lonMin: midLon,        lonMax: HH_BBOX.lonMax },
   ];
 }
 
@@ -40,45 +42,41 @@ function start(socketIo) {
 }
 
 function stop() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 }
 
 async function poll() {
   if (isPolling) {
-    console.warn("[Poller] Previous poll still running, skipping cycle");
+    console.warn("[Poller] Previous poll still running, skipping");
     return;
   }
-
   isPolling = true;
 
   try {
-    const quadrants = getQuadrants();
     const allVehicles = new Map();
 
-    for (const bbox of quadrants) {
+    for (const bbox of getQuadrants()) {
       try {
         const result = await geofox.getVehicleMap(bbox);
-
-        // API gibt "journeys" zurück, nicht "vehicles"
         const journeys = result.journeys || [];
+        console.log(`[Poller] Quadrant returned ${journeys.length} journeys`);
 
-        journeys.forEach((journey) => {
+        for (const journey of journeys) {
           const key = journey.journeyID;
-          if (key) allVehicles.set(key, normalizeJourney(journey));
-        });
+          if (!key) continue;
+          const normalized = normalizeJourney(journey);
+          if (normalized.lat && normalized.lon) {
+            allVehicles.set(key, normalized);
+          }
+        }
 
-        // 1.1s Pause zwischen Requests – Rate Limit einhalten
-        await sleep(1100);
+        await sleep(1100); // Rate Limit einhalten
       } catch (err) {
         console.error(`[Poller] Quadrant error:`, err.message);
       }
     }
 
-    const vehicleArray = Array.from(allVehicles.values())
-      .filter((v) => v.lat && v.lon); // nur Fahrzeuge mit gültiger Position
+    const vehicleArray = Array.from(allVehicles.values());
 
     await cache.set("vehicles:latest", vehicleArray, 30);
     await cache.set("vehicles:lastUpdate", new Date().toISOString(), 30);
@@ -93,41 +91,76 @@ async function poll() {
 
     console.log(`[Poller] Broadcast ${vehicleArray.length} buses`);
   } catch (err) {
-    console.error("[Poller] Error:", err.message);
+    console.error("[Poller] Fatal error:", err.message);
   } finally {
     isPolling = false;
   }
 }
 
 /**
- * Normalisiert ein Journey-Objekt der Geofox API
- * in ein einheitliches Format für das Frontend.
+ * Interpoliert die aktuelle Fahrzeugposition auf dem Track
+ * basierend auf startDateTime / endDateTime des Segments.
  *
- * Die aktuelle Position wird aus dem Track des ersten Segments
- * extrapoliert – track ist ein flaches Array [lon, lat, lon, lat, ...]
+ * Track-Format: flaches Array [lon0, lat0, lon1, lat1, ...]
+ * Timestamps: Unix-Millisekunden
  */
-function normalizeJourney(journey) {
-  const seg = journey.segments?.[0];
-  const track = seg?.track?.track || [];
+function interpolatePosition(track, startMs, endMs) {
+  if (!track || track.length < 2) return { lon: null, lat: null };
 
-  // Aktuelle Position: Mitte des Track-Arrays
-  let lon = null;
-  let lat = null;
-  if (track.length >= 2) {
-    const mid = Math.floor(track.length / 4) * 2;
-    lon = track[mid] ?? track[0];
-    lat = track[mid + 1] ?? track[1];
+  const now = Date.now();
+  const duration = endMs - startMs;
+  if (duration <= 0) {
+    return { lon: track[track.length - 2], lat: track[track.length - 1] };
   }
+
+  // Fortschritt 0.0 – 1.0
+  const progress = Math.max(0, Math.min(1, (now - startMs) / duration));
+
+  // Anzahl der Punkte im Track
+  const pointCount = Math.floor(track.length / 2);
+  if (pointCount === 1) return { lon: track[0], lat: track[1] };
+
+  const floatIdx = progress * (pointCount - 1);
+  const idx = Math.floor(floatIdx);
+  const frac = floatIdx - idx;
+
+  const nextIdx = Math.min(idx + 1, pointCount - 1);
+
+  const lon = track[idx * 2]       + frac * (track[nextIdx * 2]       - track[idx * 2]);
+  const lat = track[idx * 2 + 1]   + frac * (track[nextIdx * 2 + 1]   - track[idx * 2 + 1]);
+
+  return { lon, lat };
+}
+
+function normalizeJourney(journey) {
+  // Aktuelles Segment finden (erstes nicht-abgeschlossenes)
+  const now = Date.now();
+  const segments = journey.segments || [];
+
+  let activeSeg = segments.find(
+    (s) => s.startDateTime <= now && s.endDateTime >= now
+  ) || segments[0];
+
+  if (!activeSeg) return { id: journey.journeyID, lat: null, lon: null };
+
+  const track = activeSeg.track?.track || [];
+  const { lon, lat } = interpolatePosition(
+    track,
+    activeSeg.startDateTime,
+    activeSeg.endDateTime
+  );
 
   return {
     id: journey.journeyID,
     line: journey.line?.name || "?",
-    direction: seg?.destination || journey.line?.direction || "",
+    direction: activeSeg.destination || journey.line?.direction || "",
     lat,
     lon,
-    delay: seg?.realtimeDelay || 0,
+    delay: activeSeg.realtimeDelay || 0,
     realtime: journey.realtime || false,
     vehicleType: journey.vehicleType || "METROBUS",
+    startStation: activeSeg.startStationName || "",
+    endStation: activeSeg.endStationName || "",
     color: null,
   };
 }
