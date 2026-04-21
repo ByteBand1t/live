@@ -3,40 +3,39 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Hamburg Bus Live</title>
+    <title>HVV Live – Hamburg</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap"
-      rel="stylesheet"
-    />
-    <link
-      href="https://unpkg.com/maplibre-gl@4.0.0/dist/maplibre-gl.css"
-      rel="stylesheet"
-    />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link href="https://unpkg.com/maplibre-gl@4.0.0/dist/maplibre-gl.css" rel="stylesheet" />
     <link rel="stylesheet" href="/src/styles/main.css" />
   </head>
   <body>
     <div id="app">
-      <!-- Header -->
+
       <header id="header">
         <div class="header-left">
-          <span class="logo-icon">🚌</span>
-          <span class="logo-text">Hamburg<strong>Bus</strong></span>
+          <div class="logo">
+            <div class="logo-icon">🚌</div>
+            <div class="logo-text">HVV <span>Live</span></div>
+          </div>
           <div id="live-badge">
-            <span class="dot"></span>
-            <span id="bus-count">–</span> Busse
+            <span class="pulse-dot"></span>
+            <span id="bus-count">–</span> Busse aktiv
           </div>
         </div>
-        <div class="header-right">
+
+        <div class="header-center">
           <div id="search-container">
-            <input
-              id="search-input"
-              type="text"
-              placeholder="Haltestelle, Linie suchen…"
-              autocomplete="off"
-            />
+            <svg class="search-icon" viewBox="0 0 20 20" fill="none">
+              <circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M13 13l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+            <input id="search-input" type="text" placeholder="Haltestelle oder Linie suchen…" autocomplete="off" />
             <div id="search-results"></div>
           </div>
+        </div>
+
+        <div class="header-right">
           <div id="status-indicator" class="status-connecting">
             <span class="status-dot"></span>
             <span id="status-text">Verbinde…</span>
@@ -44,20 +43,23 @@
         </div>
       </header>
 
-      <!-- Map -->
       <div id="map"></div>
 
-      <!-- Side Panel -->
       <div id="side-panel" class="hidden">
-        <button id="panel-close">✕</button>
-        <div id="panel-content"></div>
+        <div id="panel-inner">
+          <button id="panel-close">
+            <svg viewBox="0 0 16 16" fill="none">
+              <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <div id="panel-content"></div>
+        </div>
       </div>
 
-      <!-- Bottom Stats Bar -->
       <div id="stats-bar">
-        <span id="stats-delay"></span>
-        <span id="stats-update">Noch kein Update</span>
+        <span id="stats-update">Warte auf Daten…</span>
       </div>
+
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>
