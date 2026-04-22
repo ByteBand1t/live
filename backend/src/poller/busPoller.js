@@ -10,9 +10,14 @@ const HH_BBOX = {
   lonMax: 10.3121,
 };
 
+// Max distance (m) a bus is allowed to travel between two consecutive polls.
+// 30 m/s ≈ 108 km/h; multiply by a generous 30 s gap to cover paused polls.
+const MAX_JUMP_METERS = 900;
+
 let io = null;
 let pollTimer = null;
 let isPolling = false;
+const lastPositions = new Map(); // vehicleId → { lat, lon, time }
 
 function start(socketIo) {
   io = socketIo;
@@ -36,10 +41,20 @@ async function poll() {
     const result = await geofox.getVehicleMap(HH_BBOX);
     const journeys = result.journeys || [];
     const vehicles = [];
+    const seenIds = new Set();
 
     for (const journey of journeys) {
       const normalized = normalizeJourney(journey);
-      if (normalized) vehicles.push(normalized);
+      if (normalized) {
+        vehicles.push(normalized);
+        seenIds.add(normalized.id);
+        lastPositions.set(normalized.id, { lat: normalized.lat, lon: normalized.lon, time: Date.now() });
+      }
+    }
+
+    // Evict stale entries to prevent unbounded growth
+    for (const id of lastPositions.keys()) {
+      if (!seenIds.has(id)) lastPositions.delete(id);
     }
 
     await cache.set("vehicles:latest", vehicles, 30);
@@ -74,6 +89,16 @@ function normalizeJourney(journey) {
     ? journey.journeyID
     : makeStableVehicleId(journey, activeSeg);
 
+  // Reject positions that imply impossible teleportation
+  const prev = lastPositions.get(stableId);
+  if (prev) {
+    const timeDiff = Math.max(1, (Date.now() - prev.time) / 1000);
+    const maxAllowed = Math.max(MAX_JUMP_METERS, timeDiff * 30);
+    if (haversineMeters(prev.lat, prev.lon, realtimePos.lat, realtimePos.lon) > maxAllowed) {
+      return null;
+    }
+  }
+
   return {
     id: stableId,
     line: journey.line?.name || "?",
@@ -93,8 +118,12 @@ function normalizeJourney(journey) {
 
 function isActiveSegment(segment) {
   const now = Date.now();
-  const startMs = (segment.startDateTime || 0) * 1000;
-  const endMs = (segment.endDateTime || 0) * 1000;
+  let startMs = segment.startDateTime || 0;
+  let endMs = segment.endDateTime || 0;
+  if (!startMs || !endMs) return false;
+  // Geofox returns Unix seconds (10 digits); convert to ms if needed
+  if (startMs < 1e11) startMs *= 1000;
+  if (endMs < 1e11) endMs *= 1000;
   return startMs <= now && endMs >= now;
 }
 
@@ -107,26 +136,46 @@ function makeStableVehicleId(journey, activeSeg) {
 }
 
 function extractRealtimePosition(journey, activeSeg) {
-  const candidates = [
-    activeSeg?.coordinate,
-    activeSeg?.position,
+  // Only accept genuine GPS realtime fields.
+  // activeSeg.coordinate / journey.coordinate are PLANNED stop positions and
+  // cause large jumps when the active segment changes – never use them here.
+  const realtimeCandidates = [
     activeSeg?.realtimePosition,
     activeSeg?.realtime?.coordinate,
-    journey?.coordinate,
-    journey?.position,
+    activeSeg?.realtime?.position,
     journey?.realtimePosition,
+    journey?.vehiclePosition,
+    journey?.realtimeCoordinate,
   ];
 
-  for (const candidate of candidates) {
+  for (const candidate of realtimeCandidates) {
     if (!candidate) continue;
     const lon = candidate.lon ?? candidate.lng ?? candidate.x;
     const lat = candidate.lat ?? candidate.latitude ?? candidate.y;
-    if (lat != null && lon != null) {
+    if (lat != null && lon != null && isInHamburg(lat, lon)) {
       return { lat, lon };
     }
   }
 
   return null;
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function isInHamburg(lat, lon) {
+  return (
+    lat >= HH_BBOX.latMin && lat <= HH_BBOX.latMax &&
+    lon >= HH_BBOX.lonMin && lon <= HH_BBOX.lonMax
+  );
 }
 
 module.exports = { start, stop };
