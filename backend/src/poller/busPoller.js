@@ -1,109 +1,121 @@
 const geofox = require("../geofox/client");
-const cache  = require("../cache/redis");
+const cache = require("../cache/redis");
 
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
+const POLL_INTERVAL = Math.max(1000, parseInt(process.env.POLL_INTERVAL_MS || "1000", 10));
 
 const HH_BBOX = {
-  latMin: 53.3983, latMax: 53.7393,
-  lonMin: 9.7487,  lonMax: 10.3121,
+  latMin: 53.3983,
+  latMax: 53.7393,
+  lonMin: 9.7487,
+  lonMax: 10.3121,
 };
 
-const clientViewports = new Map();
-
-let io        = null;
+let io = null;
 let pollTimer = null;
 let isPolling = false;
 
 function start(socketIo) {
   io = socketIo;
-
-  io.on("connection", (socket) => {
-    socket.on("viewport:update", (bbox) => clientViewports.set(socket.id, bbox));
-    socket.on("disconnect",      ()     => clientViewports.delete(socket.id));
-  });
-
-  console.log(`[Poller] Starting – interval: ${POLL_INTERVAL}ms`);
+  console.log(`[Poller] Starting live mode – interval: ${POLL_INTERVAL}ms`);
   poll();
   pollTimer = setInterval(poll, POLL_INTERVAL);
 }
 
 function stop() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-}
-
-function getMergedBbox() {
-  const viewports = Array.from(clientViewports.values());
-  if (!viewports.length) return HH_BBOX;
-  return {
-    latMin: Math.min(...viewports.map(v => v.latMin)),
-    latMax: Math.max(...viewports.map(v => v.latMax)),
-    lonMin: Math.min(...viewports.map(v => v.lonMin)),
-    lonMax: Math.max(...viewports.map(v => v.lonMax)),
-  };
-}
-
-function splitBbox(bbox) {
-  const latSize = bbox.latMax - bbox.latMin;
-  const lonSize = bbox.lonMax - bbox.lonMin;
-  if (latSize < 0.08 && lonSize < 0.12) return [bbox];
-  const midLat = (bbox.latMin + bbox.latMax) / 2;
-  const midLon = (bbox.lonMin + bbox.lonMax) / 2;
-  return [
-    { latMin: midLat,       latMax: bbox.latMax, lonMin: bbox.lonMin, lonMax: midLon       },
-    { latMin: midLat,       latMax: bbox.latMax, lonMin: midLon,      lonMax: bbox.lonMax  },
-    { latMin: bbox.latMin,  latMax: midLat,      lonMin: bbox.lonMin, lonMax: midLon       },
-    { latMin: bbox.latMin,  latMax: midLat,      lonMin: midLon,      lonMax: bbox.lonMax  },
-  ];
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 }
 
 async function poll() {
   if (isPolling) return;
   isPolling = true;
+
   try {
-    const boxes      = splitBbox(getMergedBbox());
-    const allVehicles = new Map();
+    const result = await geofox.getVehicleMap(HH_BBOX);
+    const journeys = result.journeys || [];
+    const vehicles = [];
 
-    for (const box of boxes) {
-      try {
-        const result   = await geofox.getVehicleMap(box);
-        const journeys = result.journeys || [];
-        console.log(`[Poller] Box returned ${journeys.length} journeys`);
-
-        for (const journey of journeys) {
-          // Nur Journeys mit echter ID verarbeiten
-          if (!journey.journeyID || journey.journeyID === "null") continue;
-          const v = normalizeJourney(journey);
-          // Nur Fahrzeuge mit gültiger Position UND Track
-          if (v.lat != null && v.lon != null && v.trackData && v.trackData.length >= 2) {
-            allVehicles.set(v.id, v);
-          }
-        }
-
-        if (boxes.length > 1) await sleep(1100);
-      } catch (err) {
-        console.error("[Poller] Box error:", err.message);
-      }
+    for (const journey of journeys) {
+      const normalized = normalizeJourney(journey);
+      if (normalized) vehicles.push(normalized);
     }
 
-    const vehicleArray = Array.from(allVehicles.values());
-    await cache.set("vehicles:latest",    vehicleArray,             30);
+    await cache.set("vehicles:latest", vehicles, 30);
     await cache.set("vehicles:lastUpdate", new Date().toISOString(), 30);
 
     if (io) {
       io.emit("vehicles:update", {
-        vehicles:  vehicleArray,
+        vehicles,
         timestamp: new Date().toISOString(),
-        count:     vehicleArray.length,
+        count: vehicles.length,
+        mode: "live",
       });
     }
-    console.log(`[Poller] Broadcast ${vehicleArray.length} buses (${boxes.length} box${boxes.length > 1 ? "es" : ""})`);
+
+    console.log(`[Poller] Broadcast ${vehicles.length} buses (${journeys.length} journeys total)`);
   } catch (err) {
-    console.error("[Poller] Fatal:", err.message);
+    console.error("[Poller] Error:", err.message);
   } finally {
     isPolling = false;
   }
 }
 
+function normalizeJourney(journey) {
+  const segments = journey.segments || [];
+  const activeSeg = segments.find(isActiveSegment) || segments[0];
+  if (!activeSeg) return null;
+
+  // Live map: nur Fahrten, die im Realtime-Modus laufen.
+  if (!journey.realtime) return null;
+
+  // Primär echte Koordinate aus der API.
+  let position = extractDirectPosition(journey, activeSeg);
+  let positionSource = "live-coordinate";
+
+  // Fallback: Wenn GTI keine direkte Koordinate liefert, aus aktuellem Segment
+  // im Realtime-Zeitfenster bestimmen (sonst würden häufig 0 Busse erscheinen).
+  if (!position) {
+    position = estimatePositionFromActiveTrack(activeSeg);
+    positionSource = "realtime-track";
+  }
+
+  if (!position) return null;
+
+  const stableId = journey.journeyID && journey.journeyID !== "null"
+    ? journey.journeyID
+    : makeStableVehicleId(journey, activeSeg);
+
+  return {
+    id: stableId,
+    line: journey.line?.name || "?",
+    lineId: journey.line?.id || null,
+    direction: activeSeg.destination || journey.line?.direction || "",
+    lat: position.lat,
+    lon: position.lon,
+    positionSource,
+    delay: normalizeDelaySeconds(activeSeg.realtimeDelay),
+    realtime: true,
+    vehicleType: journey.vehicleType || "METROBUS",
+    startStationKey: activeSeg.startStationKey || null,
+    startDateTime: activeSeg.startDateTime || null,
+    color: null,
+  };
+}
+
+function normalizeDelaySeconds(delay) {
+  if (delay == null) return 0;
+  // GTI: realtimeDelay in Minuten
+  return Math.round(Number(delay) * 60);
+}
+
+function isActiveSegment(segment) {
+  const now = Date.now();
+  const startMs = Number(segment.startDateTime || 0) * 1000;
+  const endMs = Number(segment.endDateTime || 0) * 1000;
+  return startMs <= now && endMs >= now;
+}
 
 function makeStableVehicleId(journey, activeSeg) {
   const lineId = journey.line?.id || journey.line?.name || "line";
@@ -113,7 +125,7 @@ function makeStableVehicleId(journey, activeSeg) {
   return `${lineId}|${startStation}|${startTime}|${destination}`;
 }
 
-function extractRealtimePosition(journey, activeSeg) {
+function extractDirectPosition(journey, activeSeg) {
   const candidates = [
     activeSeg?.coordinate,
     activeSeg?.position,
@@ -124,73 +136,50 @@ function extractRealtimePosition(journey, activeSeg) {
     journey?.realtimePosition,
   ];
 
-  for (const c of candidates) {
-    if (!c) continue;
-    const lon = c.lon ?? c.lng ?? c.x;
-    const lat = c.lat ?? c.latitude ?? c.y;
-    if (lat != null && lon != null) return { lat, lon };
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const lon = candidate.lon ?? candidate.lng ?? candidate.x;
+    const lat = candidate.lat ?? candidate.latitude ?? candidate.y;
+    if (lat != null && lon != null) {
+      return { lat: Number(lat), lon: Number(lon) };
+    }
   }
 
   return null;
 }
 
-function normalizeJourney(journey) {
-  const now      = Date.now();
-  const segments = journey.segments || [];
+function estimatePositionFromActiveTrack(activeSeg) {
+  const track = activeSeg?.track?.track || [];
+  if (!Array.isArray(track) || track.length < 2) return null;
 
-  // Geofox gibt startDateTime/endDateTime in Sekunden zurück → in ms umrechnen
-  const activeSeg = segments.find(s =>
-    s.startDateTime * 1000 <= now && s.endDateTime * 1000 >= now
-  ) || segments[0];
+  const startMs = Number(activeSeg.startDateTime || 0) * 1000;
+  const endMs = Number(activeSeg.endDateTime || 0) * 1000;
+  const now = Date.now();
 
-  if (!activeSeg) return { id: journey.journeyID, lat: null, lon: null };
+  if (startMs <= 0 || endMs <= 0 || endMs <= startMs) {
+    return { lon: Number(track[0]), lat: Number(track[1]) };
+  }
 
-  const track      = activeSeg.track?.track || [];
-  const segStartMs = activeSeg.startDateTime * 1000;
-  const segEndMs   = activeSeg.endDateTime   * 1000;
-
-  const realtimePos = extractRealtimePosition(journey, activeSeg);
-  const pos = realtimePos || interpolatePosition(track, segStartMs, segEndMs, now);
-
-  return {
-    id:              (journey.journeyID && journey.journeyID !== "null") ? journey.journeyID : makeStableVehicleId(journey, activeSeg),
-    line:            journey.line?.name  || "?",
-    lineId:          journey.line?.id    || null,
-    direction:       activeSeg.destination || journey.line?.direction || "",
-    lat:             pos.lat,
-    lon:             pos.lon,
-    trackData:       track,
-    segStartMs,       // jetzt korrekt in Millisekunden
-    segEndMs,         // jetzt korrekt in Millisekunden
-    delay:           activeSeg.realtimeDelay  || 0,
-    realtime:        journey.realtime         || false,
-    vehicleType:     journey.vehicleType      || "METROBUS",
-    startStationKey: activeSeg.startStationKey || null,
-    startDateTime:   activeSeg.startDateTime   || null, // Sekunden – für departureCourse
-    color:           null,
-  };
-}
-
-function interpolatePosition(track, startMs, endMs, now) {
-  if (!track || track.length < 2) return { lat: null, lon: null };
-  const duration = endMs - startMs;
-  if (duration <= 0) return { lon: track[track.length - 2], lat: track[track.length - 1] };
-
-  const progress   = Math.max(0, Math.min(1, (now - startMs) / duration));
+  const progress = Math.max(0, Math.min(1, (now - startMs) / (endMs - startMs)));
   const pointCount = Math.floor(track.length / 2);
-  if (pointCount === 1) return { lon: track[0], lat: track[1] };
+  if (pointCount === 1) {
+    return { lon: Number(track[0]), lat: Number(track[1]) };
+  }
 
-  const floatIdx = progress * (pointCount - 1);
-  const idx      = Math.floor(floatIdx);
-  const frac     = floatIdx - idx;
-  const next     = Math.min(idx + 1, pointCount - 1);
+  const floatIndex = progress * (pointCount - 1);
+  const baseIndex = Math.floor(floatIndex);
+  const nextIndex = Math.min(baseIndex + 1, pointCount - 1);
+  const frac = floatIndex - baseIndex;
+
+  const lonA = Number(track[baseIndex * 2]);
+  const latA = Number(track[baseIndex * 2 + 1]);
+  const lonB = Number(track[nextIndex * 2]);
+  const latB = Number(track[nextIndex * 2 + 1]);
 
   return {
-    lon: track[idx*2]   + frac * (track[next*2]   - track[idx*2]),
-    lat: track[idx*2+1] + frac * (track[next*2+1] - track[idx*2+1]),
+    lon: lonA + (lonB - lonA) * frac,
+    lat: latA + (latB - latA) * frac,
   };
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 module.exports = { start, stop };
