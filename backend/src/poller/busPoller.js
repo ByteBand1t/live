@@ -10,14 +10,12 @@ const HH_BBOX = {
   lonMax: 10.3121,
 };
 
-// Max distance (m) a bus is allowed to travel between two consecutive polls.
-// 30 m/s ≈ 108 km/h; multiply by a generous 30 s gap to cover paused polls.
 const MAX_JUMP_METERS = 900;
 
 let io = null;
 let pollTimer = null;
 let isPolling = false;
-const lastPositions = new Map(); // vehicleId → { lat, lon, time }
+const lastPositions = new Map();
 
 function start(socketIo) {
   io = socketIo;
@@ -48,11 +46,14 @@ async function poll() {
       if (normalized) {
         vehicles.push(normalized);
         seenIds.add(normalized.id);
-        lastPositions.set(normalized.id, { lat: normalized.lat, lon: normalized.lon, time: Date.now() });
+        lastPositions.set(normalized.id, {
+          lat: normalized.lat,
+          lon: normalized.lon,
+          time: Date.now(),
+        });
       }
     }
 
-    // Evict stale entries to prevent unbounded growth
     for (const id of lastPositions.keys()) {
       if (!seenIds.has(id)) lastPositions.delete(id);
     }
@@ -79,22 +80,31 @@ async function poll() {
 
 function normalizeJourney(journey) {
   const segments = journey.segments || [];
-  const activeSeg = segments.find(isActiveSegment) || segments[0];
+
+  const activeSeg =
+    segments.find(isActiveSegment) ??
+    segments.find((s) => s?.track?.track?.length >= 2) ??
+    segments[0];
+
   if (!activeSeg) return null;
 
   const realtimePos = extractRealtimePosition(journey, activeSeg);
   if (!realtimePos) return null;
+  if (!isInHamburg(realtimePos.lat, realtimePos.lon)) return null;
 
-  const stableId = journey.journeyID && journey.journeyID !== "null"
-    ? journey.journeyID
-    : makeStableVehicleId(journey, activeSeg);
+  const stableId =
+    journey.journeyID && journey.journeyID !== "null"
+      ? journey.journeyID
+      : makeStableVehicleId(journey, activeSeg);
 
-  // Reject positions that imply impossible teleportation
   const prev = lastPositions.get(stableId);
   if (prev) {
     const timeDiff = Math.max(1, (Date.now() - prev.time) / 1000);
     const maxAllowed = Math.max(MAX_JUMP_METERS, timeDiff * 30);
-    if (haversineMeters(prev.lat, prev.lon, realtimePos.lat, realtimePos.lon) > maxAllowed) {
+    if (
+      haversineMeters(prev.lat, prev.lon, realtimePos.lat, realtimePos.lon) >
+      maxAllowed
+    ) {
       return null;
     }
   }
@@ -121,7 +131,6 @@ function isActiveSegment(segment) {
   let startMs = segment.startDateTime || 0;
   let endMs = segment.endDateTime || 0;
   if (!startMs || !endMs) return false;
-  // Geofox returns Unix seconds (10 digits); convert to ms if needed
   if (startMs < 1e11) startMs *= 1000;
   if (endMs < 1e11) endMs *= 1000;
   return startMs <= now && endMs >= now;
@@ -131,33 +140,42 @@ function makeStableVehicleId(journey, activeSeg) {
   const lineId = journey.line?.id || journey.line?.name || "line";
   const startStation = activeSeg?.startStationKey || "station";
   const startTime = activeSeg?.startDateTime || "time";
-  const destination = activeSeg?.destination || journey.line?.direction || "dest";
+  const destination =
+    activeSeg?.destination || journey.line?.direction || "dest";
   return `${lineId}|${startStation}|${startTime}|${destination}`;
 }
 
 function extractRealtimePosition(journey, activeSeg) {
-  // Only accept genuine GPS realtime fields.
-  // activeSeg.coordinate / journey.coordinate are PLANNED stop positions and
-  // cause large jumps when the active segment changes – never use them here.
-  const realtimeCandidates = [
-    activeSeg?.realtimePosition,
-    activeSeg?.realtime?.coordinate,
-    activeSeg?.realtime?.position,
-    journey?.realtimePosition,
-    journey?.vehiclePosition,
-    journey?.realtimeCoordinate,
-  ];
+  const trackData = activeSeg?.track?.track;
+  if (!trackData || trackData.length < 2) return null;
 
-  for (const candidate of realtimeCandidates) {
-    if (!candidate) continue;
-    const lon = candidate.lon ?? candidate.lng ?? candidate.x;
-    const lat = candidate.lat ?? candidate.latitude ?? candidate.y;
-    if (lat != null && lon != null && isInHamburg(lat, lon)) {
-      return { lat, lon };
-    }
+  // Track-Array ist interleaved: [lon0, lat0, lon1, lat1, ...]
+  const coords = [];
+  for (let i = 0; i + 1 < trackData.length; i += 2) {
+    coords.push({ lon: trackData[i], lat: trackData[i + 1] });
   }
+  if (coords.length === 0) return null;
 
-  return null;
+  let startMs = activeSeg.startDateTime || 0;
+  let endMs = activeSeg.endDateTime || 0;
+  if (startMs < 1e11) startMs *= 1000;
+  if (endMs < 1e11) endMs *= 1000;
+
+  const now = Date.now();
+
+  if (!startMs || !endMs || now <= startMs) return coords[0];
+  if (now >= endMs) return coords[coords.length - 1];
+
+  const ratio = (now - startMs) / (endMs - startMs);
+  const idx = ratio * (coords.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.min(lo + 1, coords.length - 1);
+  const frac = idx - lo;
+
+  return {
+    lat: coords[lo].lat + frac * (coords[hi].lat - coords[lo].lat),
+    lon: coords[lo].lon + frac * (coords[hi].lon - coords[lo].lon),
+  };
 }
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
@@ -167,14 +185,18 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 function isInHamburg(lat, lon) {
   return (
-    lat >= HH_BBOX.latMin && lat <= HH_BBOX.latMax &&
-    lon >= HH_BBOX.lonMin && lon <= HH_BBOX.lonMax
+    lat >= HH_BBOX.latMin &&
+    lat <= HH_BBOX.latMax &&
+    lon >= HH_BBOX.lonMin &&
+    lon <= HH_BBOX.lonMax
   );
 }
 
