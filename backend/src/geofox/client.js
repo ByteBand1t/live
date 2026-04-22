@@ -114,7 +114,7 @@ async function departureCourse(lineKey, stationId, time) {
 }
 
 async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
-  const now = Date.now();
+  const now = new Date();
   return geofoxRequest("getVehicleMap", {
     coordinateType: "EPSG_4326",
     boundingBox: {
@@ -123,10 +123,11 @@ async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
     },
     vehicleTypes,
     realtime: true,
-    periodBegin: now,
-    periodEnd: now + 3600000,
+    periodBegin: { date: formatDate(now), time: formatTime(now) },
+    periodEnd: { date: formatDate(now), time: formatTime(new Date(now.getTime() + 3600000)) },
   });
 }
+
 
 async function getTrackCoordinates(stopPointKeys) {
   return geofoxRequest("getTrackCoordinates", {
