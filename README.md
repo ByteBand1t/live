@@ -1,6 +1,6 @@
-# 🚌 Hamburg Bus Live
+# 🚌 Livemap
 
-Live-Karte aller HVV-Busse in Hamburg – betrieben über die Geofox GTI API.
+Live-Karte aller Busse in Hamburg mit **echter Live-Position** aus der Geofox GTI API (keine berechneten Positionen).
 
 ## Stack
 
@@ -19,8 +19,8 @@ Live-Karte aller HVV-Busse in Hamburg – betrieben über die Geofox GTI API.
 
 ```bash
 # 1. Repo klonen
-git clone https://github.com/DEIN_USER/hamburg-bus-live.git
-cd hamburg-bus-live
+git clone https://github.com/DEIN_USER/livemap.git
+cd livemap
 
 # 2. Zugangsdaten setzen
 cp .env.example .env
@@ -37,7 +37,7 @@ docker compose up --build
 ## Deployment via Portainer
 
 1. In Portainer → **Stacks** → **Add Stack**
-2. Name: `hamburg-bus-live`
+2. Name: `livemap`
 3. "Repository" wählen → GitHub URL eintragen
 4. Environment Variables setzen:
    - `GEOFOX_USER=MaximilianMevs`
@@ -53,7 +53,7 @@ Oder alternativ mit Portainer Webhook (Auto-Deploy bei Git Push):
 ## Projektstruktur
 
 ```
-hamburg-bus-live/
+livemap/
 ├── docker-compose.yml
 ├── .env.example               ← Vorlage für Zugangsdaten
 │
@@ -67,7 +67,7 @@ hamburg-bus-live/
 │       ├── cache/
 │       │   └── redis.js       ← Redis Cache Layer
 │       ├── poller/
-│       │   └── busPoller.js   ← Holt alle 5s Bus-Positionen, broadcast via WS
+│       │   └── busPoller.js   ← Holt jede Sekunde Live-Positionen, broadcast via WS
 │       └── routes/
 │           └── api.js         ← REST Endpoints
 │
@@ -134,9 +134,9 @@ Implementiert in `backend/src/geofox/client.js`.
 ⚠️ Geofox sperrt Accounts bei **> 1 Request/Sekunde** (temporär).
 
 Unsere Lösung:
-- **Ein zentraler Poller** im Backend (nicht jeder Browser-Tab ruft die API auf)
-- **Redis-Cache** für alle Endpoints (Departures: 30s, Stations: 24h, etc.)
-- **4 Quadranten** mit 1,1s Pause zwischen den Requests
+- **Zentrale Request-Queue** im Backend: maximal **1 API-Request pro Sekunde** über alle Endpunkte hinweg
+- **Live-only Poller** mit mindestens 1000ms Intervall
+- **Nur Fahrzeuge mit echter Echtzeitposition** werden veröffentlicht
 
 ---
 
@@ -162,5 +162,5 @@ Unsere Lösung:
 | `GEOFOX_PASSWORD` | API Passwort (für HMAC) | – |
 | `PORT` | Backend-Port | `3001` |
 | `REDIS_URL` | Redis-Verbindung | `redis://redis:6379` |
-| `POLL_INTERVAL_MS` | Polling-Intervall | `5000` |
+| `POLL_INTERVAL_MS` | Polling-Intervall (min. 1000ms) | `1000` |
 | `HH_BBOX_*` | Hamburg Bounding Box | Hamburg gesamt |
