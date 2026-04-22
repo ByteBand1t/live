@@ -10,9 +10,7 @@ var selectedBusId    = null;
 var searchTimeout    = null;
 var viewportDebounce = null;
 
-var POLL_MS = 5000; // Fallback, wird aus Live-Updates dynamisch angepasst
 var STALE_VEHICLE_MS = 15000;
-var lastServerTs = null;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", function() {
@@ -45,8 +43,6 @@ function initMap() {
 
   map.on("load", function() {
     sendViewport();
-    requestAnimationFrame(animationTick);
-
     fetch("/api/stations")
       .then(function(r) { return r.json(); })
       .then(function(d) {
@@ -75,48 +71,12 @@ function sendViewport() {
   }, 400);
 }
 
-// ─── Animation Loop ───────────────────────────────────────────────────────────
-// Kein Track-Interpolation. Simpel: von letzter bekannter Position
-// zur neuen Position über POLL_MS Millisekunden gleiten.
-// Kein Timing-Problem, keine Sprünge.
-
-function animationTick() {
-  var now = Date.now();
-
-  for (var id in allVehicles) {
-    var v = allVehicles[id];
-    if (!busMarkers[id]) continue;
-    if (v._fromLon === undefined) continue;
-
-    // Fortschritt 0→1 über POLL_MS, smooth-step Easing
-    var t     = Math.min(1.0, (now - v._updateTime) / POLL_MS);
-    var alpha = t * t * (3.0 - 2.0 * t); // smooth step
-
-    v._renderLon = v._fromLon + alpha * (v._toLon - v._fromLon);
-    v._renderLat = v._fromLat + alpha * (v._toLat - v._fromLat);
-
-    busMarkers[id].marker.setLngLat([v._renderLon, v._renderLat]);
-  }
-
-  requestAnimationFrame(animationTick);
-}
-
+// ─── Live-Positionen (ohne Interpolation) ───────────────────────────────────
 // ─── Bus Markers ──────────────────────────────────────────────────────────────
-function syncBusMarkers(vehicles, serverTimestamp) {
+function syncBusMarkers(vehicles) {
   var bounds = map.getBounds();
   var newIds = {};
   var now    = Date.now();
-
-  if (serverTimestamp) {
-    var ts = new Date(serverTimestamp).getTime();
-    if (!isNaN(ts)) {
-      if (lastServerTs) {
-        var dt = ts - lastServerTs;
-        if (dt >= 1500 && dt <= 20000) POLL_MS = dt;
-      }
-      lastServerTs = ts;
-    }
-  }
 
   for (var i = 0; i < vehicles.length; i++) {
     var v = vehicles[i];
@@ -125,19 +85,10 @@ function syncBusMarkers(vehicles, serverTimestamp) {
 
     var existing = allVehicles[v.id];
 
-    // Render-Position beibehalten damit der Übergang nahtlos weiterläuft
-    v._fromLon   = existing ? existing._renderLon : v.lon;
-    v._fromLat   = existing ? existing._renderLat : v.lat;
-    v._toLon     = v.lon;
-    v._toLat     = v.lat;
     v._updateTime = now;
-    v._renderLon = v._fromLon;
-    v._renderLat = v._fromLat;
-
     allVehicles[v.id] = v;
 
-    // Prüfe ob Bus im Viewport ist (anhand Zielposition)
-    if (!bounds.contains([v._toLon, v._toLat])) {
+    if (!bounds.contains([v.lon, v.lat])) {
       if (busMarkers[v.id]) {
         busMarkers[v.id].marker.remove();
         delete busMarkers[v.id];
@@ -148,11 +99,12 @@ function syncBusMarkers(vehicles, serverTimestamp) {
     if (!busMarkers[v.id]) {
       var el     = createBusEl(v);
       var marker = new maplibregl.Marker({ element: el, anchor: "center" })
-        .setLngLat([v._fromLon, v._fromLat])
+        .setLngLat([v.lon, v.lat])
         .addTo(map);
       busMarkers[v.id] = { marker: marker, el: el };
       attachBusClick(v.id, el);
     } else {
+      busMarkers[v.id].marker.setLngLat([v.lon, v.lat]);
       updateBusEl(busMarkers[v.id].el, v);
     }
   }
@@ -262,15 +214,15 @@ function flyTo(lon, lat, zoom) {
 // ─── Socket ───────────────────────────────────────────────────────────────────
 function initSocket() {
   socket = io({ transports: ["websocket", "polling"] });
-  socket.on("connect",       function() { setStatus("connected", "Live");     sendViewport(); });
+  socket.on("connect",       function() { setStatus("connected", "Live aktiv");     sendViewport(); });
   socket.on("disconnect",    function() { setStatus("error",     "Getrennt"); });
   socket.on("connect_error", function() { setStatus("error",     "Fehler");   });
 
   socket.on("vehicles:update", function(data) {
-    syncBusMarkers(data.vehicles || [], data.timestamp);
+    syncBusMarkers(data.vehicles || []);
     document.getElementById("bus-count").textContent     = data.count || 0;
     document.getElementById("stats-update").textContent  =
-      "Zuletzt: " + new Date(data.timestamp).toLocaleTimeString("de-DE");
+      "Live-Update: " + new Date(data.timestamp).toLocaleTimeString("de-DE") + " · nur echte GPS-Positionen";
   });
 }
 
@@ -297,9 +249,9 @@ function closePanel() {
 
 function showLoadingPanel(title) {
   openPanel(
-    '<div class="panel-chip">Lädt</div>' +
+    '<div class="panel-chip">Live-Ladevorgang</div>' +
     '<div class="panel-title">' + title + '</div>' +
-    '<div class="panel-loading"><div class="spinner"></div>Echtzeit-Daten…</div>'
+    '<div class="panel-loading"><div class="spinner"></div>Nur echte Live-Positionen…</div>'
   );
 }
 
@@ -308,8 +260,8 @@ function handleBusClick(bus) {
   selectedBusId = bus.id;
   if (busMarkers[bus.id]) updateBusEl(busMarkers[bus.id].el, bus);
 
-  var lon = bus._renderLon !== undefined ? bus._renderLon : bus.lon;
-  var lat = bus._renderLat !== undefined ? bus._renderLat : bus.lat;
+  var lon = bus.lon;
+  var lat = bus.lat;
   flyTo(lon, lat, 15);
   showLoadingPanel("Linie " + (bus.line || "?"));
 

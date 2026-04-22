@@ -1,44 +1,84 @@
 const crypto = require("crypto");
+
 const GTI_BASE_URL = "https://gti.geofox.de/gti/public";
+const MIN_REQUEST_INTERVAL_MS = Math.max(
+  1000,
+  parseInt(process.env.GEOFOX_MIN_INTERVAL_MS || "1000", 10)
+);
 
 const ALL_BUS_TYPES = [
-  "METROBUS", "REGIONALBUS", "SCHNELLBUS",
-  "NACHTBUS", "XPRESSBUS", "AST", "EILBUS"
+  "METROBUS",
+  "REGIONALBUS",
+  "SCHNELLBUS",
+  "NACHTBUS",
+  "XPRESSBUS",
+  "AST",
+  "EILBUS",
 ];
+
+let nextRequestAt = 0;
+let queue = Promise.resolve();
 
 function createSignature(body, password) {
   return crypto.createHmac("sha1", password).update(body, "utf8").digest("base64");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withRateLimit(task) {
+  queue = queue
+    .catch(() => undefined)
+    .then(async () => {
+      const now = Date.now();
+      const waitMs = Math.max(0, nextRequestAt - now);
+      if (waitMs > 0) await sleep(waitMs);
+
+      nextRequestAt = Date.now() + MIN_REQUEST_INTERVAL_MS;
+      return task();
+    });
+
+  return queue;
+}
+
 async function geofoxRequest(endpoint, payload) {
-  const user = process.env.GEOFOX_USER;
-  const password = process.env.GEOFOX_PASSWORD;
-  const body = JSON.stringify(payload);
-  const signature = createSignature(body, password);
+  return withRateLimit(async () => {
+    const user = process.env.GEOFOX_USER;
+    const password = process.env.GEOFOX_PASSWORD;
 
-  const response = await fetch(`${GTI_BASE_URL}/${endpoint}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      Accept: "application/json",
-      "geofox-auth-type": "HmacSHA1",
-      "geofox-auth-user": user,
-      "geofox-auth-signature": signature,
-      "X-Platform": "web",
-    },
-    body,
+    if (!user || !password) {
+      throw new Error("Missing GEOFOX_USER or GEOFOX_PASSWORD");
+    }
+
+    const body = JSON.stringify(payload);
+    const signature = createSignature(body, password);
+
+    const response = await fetch(`${GTI_BASE_URL}/${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+        Accept: "application/json",
+        "geofox-auth-type": "HmacSHA1",
+        "geofox-auth-user": user,
+        "geofox-auth-signature": signature,
+        "X-Platform": "web",
+      },
+      body,
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Geofox API error: ${response.status} – ${text}`);
+    }
+
+    const data = await response.json();
+    if (data.returnCode !== "OK") {
+      throw new Error(`Geofox returnCode: ${data.returnCode} – ${data.errorText || ""}`);
+    }
+
+    return data;
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Geofox API error: ${response.status} – ${text}`);
-  }
-
-  const data = await response.json();
-  if (data.returnCode !== "OK") {
-    throw new Error(`Geofox returnCode: ${data.returnCode} – ${data.errorText || ""}`);
-  }
-  return data;
 }
 
 async function init() {
@@ -78,13 +118,13 @@ async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
   return geofoxRequest("getVehicleMap", {
     coordinateType: "EPSG_4326",
     boundingBox: {
-      lowerLeft:  { x: boundingBox.lonMin, y: boundingBox.latMin },
+      lowerLeft: { x: boundingBox.lonMin, y: boundingBox.latMin },
       upperRight: { x: boundingBox.lonMax, y: boundingBox.latMax },
     },
     vehicleTypes,
     realtime: true,
     periodBegin: now,
-    periodEnd: now + 3600000, // 1 Stunde voraus
+    periodEnd: now + 3600000,
   });
 }
 
@@ -109,15 +149,22 @@ async function getAnnouncements() {
 
 function formatDate(date) {
   const d = new Date(date);
-  return `${String(d.getDate()).padStart(2,"0")}.${String(d.getMonth()+1).padStart(2,"0")}.${d.getFullYear()}`;
+  return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}.${d.getFullYear()}`;
 }
 
 function formatTime(date) {
   const d = new Date(date);
-  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 module.exports = {
-  init, checkName, departureList, departureCourse,
-  getVehicleMap, getTrackCoordinates, listStations, listLines, getAnnouncements
+  init,
+  checkName,
+  departureList,
+  departureCourse,
+  getVehicleMap,
+  getTrackCoordinates,
+  listStations,
+  listLines,
+  getAnnouncements,
 };

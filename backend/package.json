@@ -1,7 +1,7 @@
 {
-  "name": "hamburg-bus-live-backend",
+  "name": "livemap-backend",
   "version": "1.0.0",
-  "description": "Backend for Hamburg Bus Live - Geofox API proxy with WebSocket",
+  "description": "Backend for Livemap - Geofox API proxy with strict live-only bus map",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
