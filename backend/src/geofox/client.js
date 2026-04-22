@@ -122,7 +122,6 @@ async function getVehicleMap(boundingBox, vehicleTypes = ALL_BUS_TYPES) {
       upperRight: { x: boundingBox.lonMax, y: boundingBox.latMax },
     },
     vehicleTypes,
-    realtime: true,
     periodBegin: { date: formatDate(now), time: formatTime(now) },
     periodEnd: { date: formatDate(now), time: formatTime(new Date(now.getTime() + 3600000)) },
   });
